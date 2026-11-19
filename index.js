@@ -2,7 +2,7 @@
 
 import { execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { readFileSync, writeFileSync } from "node:fs";
+import { readFileSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import path from "node:path";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
@@ -612,6 +612,41 @@ async function getFormattedTransaction(budgetId, transactionId) {
 // succeeded). Rows older than the window fall back to per-transaction GETs.
 const VERIFY_REFETCH_WINDOW_DAYS = 90;
 
+// Group rows by account and take each account's [min, max] date. One
+// account-scoped list request per group covers rows of any age without
+// downloading the whole budget, so old rows no longer fall through to one
+// GET each (a 100-row reconcile of year-old rows cost ~100 GETs, half the
+// hourly rate budget).
+function accountDateScopes(rows) {
+  const scopes = new Map();
+  for (const t of rows) {
+    if (!t?.account_id || !t?.date) continue;
+    const s = scopes.get(t.account_id);
+    if (!s) scopes.set(t.account_id, { accountId: t.account_id, sinceDate: t.date, untilDate: t.date });
+    else {
+      if (t.date < s.sinceDate) s.sinceDate = t.date;
+      if (t.date > s.untilDate) s.untilDate = t.date;
+    }
+  }
+  return [...scopes.values()];
+}
+
+// Fill byId from account-scoped list requests. Failures are swallowed: callers
+// fall back to per-transaction GETs for anything still missing.
+async function fetchScopedTransactions(budgetId, wantedIds, scopes, byId) {
+  for (const scope of scopes) {
+    try {
+      const data = await fetchTransactions({ budgetId, ...scope });
+      for (const t of data.transactions) {
+        const id = normalizeTransactionId(t.id);
+        if (wantedIds.has(id) && !byId.has(id)) byId.set(id, formatTransaction(t));
+      }
+    } catch {
+      // Fall through.
+    }
+  }
+}
+
 async function prefetchUpdatedTransactions(budgetId, requestedUpdates, responseTransactions = []) {
   const wantedIds = new Set(requestedUpdates.map((r) => r.id && normalizeTransactionId(r.id)).filter(Boolean));
   const dates = [];
@@ -619,7 +654,10 @@ async function prefetchUpdatedTransactions(budgetId, requestedUpdates, responseT
   for (const r of requestedUpdates) if (r.date) dates.push(r.date);
 
   const byId = new Map();
-  if (dates.length > 0) {
+  // The PATCH response carries each row's account and post-write date, which
+  // is exactly the range to refetch.
+  await fetchScopedTransactions(budgetId, wantedIds, accountDateScopes(responseTransactions), byId);
+  if (dates.length > 0 && byId.size < wantedIds.size) {
     const minDate = dates.reduce((min, d) => (d < min ? d : min));
     const windowStart = new Date(Date.now() - VERIFY_REFETCH_WINDOW_DAYS * 24 * 60 * 60 * 1000)
       .toISOString().slice(0, 10);
@@ -628,7 +666,7 @@ async function prefetchUpdatedTransactions(budgetId, requestedUpdates, responseT
       const data = await fetchTransactions({ budgetId, sinceDate });
       for (const t of data.transactions) {
         const id = normalizeTransactionId(t.id);
-        if (wantedIds.has(id)) byId.set(id, formatTransaction(t));
+        if (wantedIds.has(id) && !byId.has(id)) byId.set(id, formatTransaction(t));
       }
     } catch {
       // The write already succeeded; a failed bulk refetch (e.g. a response
@@ -2135,34 +2173,78 @@ registerTool(
     })
 );
 
+const transactionUpdateItemSchema = z.object({
+  id: z.string().min(1).optional().describe("Transaction ID. Provide either id or importId (not both) to identify the transaction."),
+  importId: z.string().min(1).max(36).optional().describe("Import ID used to look up the transaction instead of id. Updating the import_id of an existing transaction is not allowed."),
+  accountId: z.string().optional().describe("Account ID"),
+  date: z.string().optional().describe("Transaction date (YYYY-MM-DD)"),
+  amount: z.number().optional().describe("Amount in dollars"),
+  payeeId: z.string().nullable().optional().describe("Payee ID (null to remove)"),
+  payeeName: z.string().max(200).nullable().optional().describe("Payee name (null to clear)"),
+  categoryId: z.string().nullable().optional().describe("Category ID (null to uncategorize)"),
+  memo: z.string().nullable().optional().describe("Transaction memo (null to clear)"),
+  cleared: z.enum(["cleared", "uncleared", "reconciled"]).optional().describe("Cleared status"),
+  approved: z.boolean().optional().describe("Whether transaction is approved"),
+  flagColor: z.enum(["red", "orange", "yellow", "green", "blue", "purple"]).nullable().optional().describe("Flag color (null to remove)"),
+  subtransactions: z.array(subtransactionInputSchema).optional().describe("Convert the transaction into a split. Not supported on transactions that are already splits."),
+});
+
+const TRANSACTIONS_FILE_MAX_BYTES = 5 * 1024 * 1024;
+
+// Read a batch of updates from a local JSON file so large batches (hundreds of
+// ids) need not be inlined in the tool call. The file must be an absolute .json
+// path holding an array that passes the same schema as the inline parameter.
+// Error messages name the path and schema issue only, never file contents.
+function readTransactionsFile(filePath) {
+  if (!path.isAbsolute(filePath) || path.extname(filePath).toLowerCase() !== ".json") {
+    throw new Error("transactionsFile must be an absolute path to a .json file.");
+  }
+  let text;
+  try {
+    const st = statSync(filePath);
+    if (!st.isFile()) throw new Error("not a regular file");
+    if (st.size > TRANSACTIONS_FILE_MAX_BYTES) throw new Error(`larger than ${TRANSACTIONS_FILE_MAX_BYTES} bytes`);
+    text = readFileSync(filePath, "utf8");
+  } catch (err) {
+    throw new Error(`Could not read transactionsFile ${filePath}: ${err.message}`);
+  }
+  let parsed;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    throw new Error(`transactionsFile ${filePath} is not valid JSON.`);
+  }
+  const result = z.array(transactionUpdateItemSchema).min(1).safeParse(parsed);
+  if (!result.success) {
+    const issues = result.error.issues.slice(0, 5).map((i) => `${i.path.join(".") || "(root)"}: ${i.message}`);
+    throw new Error(`transactionsFile ${filePath} failed validation: ${issues.join("; ")}`);
+  }
+  return result.data;
+}
+
 registerTool(
   "update_transactions",
-  { description: "Batch update multiple transactions. Each transaction object must include its id and the fields to update. IMPORTANT: only use transaction IDs extracted from get_transactions / review_unapproved results — never compose IDs by hand (fabricated IDs return 'transaction does not exist in this budget' errors). For combined category+approval changes, include both 'categoryId' and 'approved: true' in the same entry. This tool refetches each transaction after the bulk update, verifies requested fields actually persisted, and retries mismatches once through single-transaction updates. Never trust review_unapproved counts alone after approving transactions; use this response's verification block or get_transaction to confirm fields.", inputSchema: {
+  { description: "Batch update multiple transactions. Each transaction object must include its id and the fields to update. IMPORTANT: only use transaction IDs extracted from get_transactions / review_unapproved results — never compose IDs by hand (fabricated IDs return 'transaction does not exist in this budget' errors). For combined category+approval changes, include both 'categoryId' and 'approved: true' in the same entry. This tool refetches each transaction after the bulk update, verifies requested fields actually persisted, and retries mismatches once through single-transaction updates. Never trust review_unapproved counts alone after approving transactions; use this response's verification block or get_transaction to confirm fields. For large batches pass transactionsFile instead of transactions, and pass scope when the rows share one account so the pre-write snapshot costs one request instead of one per row.", inputSchema: {
     budgetId: z.string().optional().describe("Budget ID (uses default if not provided)"),
     transactions: z
-      .array(
-        z.object({
-          id: z.string().min(1).optional().describe("Transaction ID. Provide either id or importId (not both) to identify the transaction."),
-          importId: z.string().min(1).max(36).optional().describe("Import ID used to look up the transaction instead of id. Updating the import_id of an existing transaction is not allowed."),
-          accountId: z.string().optional().describe("Account ID"),
-          date: z.string().optional().describe("Transaction date (YYYY-MM-DD)"),
-          amount: z.number().optional().describe("Amount in dollars"),
-          payeeId: z.string().nullable().optional().describe("Payee ID (null to remove)"),
-          payeeName: z.string().max(200).nullable().optional().describe("Payee name (null to clear)"),
-          categoryId: z.string().nullable().optional().describe("Category ID (null to uncategorize)"),
-          memo: z.string().nullable().optional().describe("Transaction memo (null to clear)"),
-          cleared: z.enum(["cleared", "uncleared", "reconciled"]).optional().describe("Cleared status"),
-          approved: z.boolean().optional().describe("Whether transaction is approved"),
-          flagColor: z.enum(["red", "orange", "yellow", "green", "blue", "purple"]).nullable().optional().describe("Flag color (null to remove)"),
-          subtransactions: z.array(subtransactionInputSchema).optional().describe("Convert the transaction into a split. Not supported on transactions that are already splits."),
-        })
-      )
-      .describe("Array of transaction updates"),
+      .array(transactionUpdateItemSchema)
+      .optional()
+      .describe("Array of transaction updates. Provide exactly one of transactions or transactionsFile."),
+    transactionsFile: z.string().optional().describe("Absolute path to a local .json file containing the array of transaction updates (same shape as transactions, max 5 MB). Use for batches too large to inline."),
+    scope: z.object({
+      accountId: z.string().describe("Account all updated rows belong to"),
+      sinceDate: z.string().describe("Earliest row date (YYYY-MM-DD)"),
+      untilDate: z.string().optional().describe("Latest row date (YYYY-MM-DD)"),
+    }).optional().describe("Optional hint for the pre-write snapshot: one account-scoped list request replaces per-row GETs for rows older than 90 days. Rows outside the scope still work; they just cost a GET each."),
     returnSummary: z.boolean().optional().describe("If true, return compact counts (updated_count, approved_count, and verification counts) instead of the full updated-transaction objects. Use for large batches (~50+) whose full response would exceed the inline tool-result limit; the write is performed identically either way."),
   } },
-  ({ budgetId, transactions: txns, returnSummary }) =>
+  ({ budgetId, transactions: inlineTxns, transactionsFile, scope, returnSummary }) =>
     run(async () => {
       const bid = resolveBudgetId(budgetId);
+      if ((inlineTxns !== undefined) === (transactionsFile !== undefined)) {
+        throw new Error("Provide exactly one of transactions or transactionsFile.");
+      }
+      const txns = transactionsFile !== undefined ? readTransactionsFile(transactionsFile) : inlineTxns;
       for (const t of txns) {
         // Same predicate the mapping below uses; a present-but-empty id must
         // be rejected here, not silently sent to YNAB as the lookup key.
@@ -2176,7 +2258,7 @@ registerTool(
       }));
       // Capture before-states pre-write for the undo journal (id-based rows
       // only; importId-only rows have no id yet and journal as non-undoable).
-      const beforeById = await fetchTransactionsByIds(bid, txns.filter((t) => t.id !== undefined).map((t) => t.id));
+      const beforeById = await fetchTransactionsByIds(bid, txns.filter((t) => t.id !== undefined).map((t) => t.id), scope);
       const { data } = await api.transactions.updateTransactions(bid, {
         transactions: mapped,
       });
@@ -2908,19 +2990,24 @@ function beforeFieldsForUpdate(requested, beforeTransaction) {
 
 // One list request covering recent history, with per-transaction GET fallback
 // only for stragglers — same budget-friendly shape as prefetchUpdatedTransactions.
-async function fetchTransactionsByIds(budgetId, ids) {
+async function fetchTransactionsByIds(budgetId, ids, scope) {
   const wanted = new Set(ids.map(normalizeTransactionId));
   const byId = new Map();
+  // Optional caller hint: rows' account and date range aren't known before the
+  // write, so without it rows older than the window cost one GET each.
+  if (scope) await fetchScopedTransactions(budgetId, wanted, [scope], byId);
   const sinceDate = new Date(Date.now() - VERIFY_REFETCH_WINDOW_DAYS * 24 * 60 * 60 * 1000)
     .toISOString().slice(0, 10);
-  try {
-    const data = await fetchTransactions({ budgetId, sinceDate });
-    for (const t of data.transactions) {
-      const id = normalizeTransactionId(t.id);
-      if (wanted.has(id)) byId.set(id, formatTransaction(t));
+  if (byId.size < wanted.size) {
+    try {
+      const data = await fetchTransactions({ budgetId, sinceDate });
+      for (const t of data.transactions) {
+        const id = normalizeTransactionId(t.id);
+        if (wanted.has(id) && !byId.has(id)) byId.set(id, formatTransaction(t));
+      }
+    } catch {
+      // Fall through to per-transaction GETs.
     }
-  } catch {
-    // Fall through to per-transaction GETs.
   }
   const missing = [...wanted].filter((id) => !byId.has(id));
   await Promise.all(missing.map(async (id) => {
@@ -3719,6 +3806,9 @@ return {
     withWriteGateDescription,
     parseToolExecuteInput,
     verifyBulkTransactionUpdates,
+    accountDateScopes,
+    fetchTransactionsByIds,
+    readTransactionsFile,
     beforeFieldsForUpdate,
     summarizeIncomeExpenseByMonth,
     detectRecurringFromTransactions,
@@ -3777,6 +3867,9 @@ const {
   withWriteGateDescription,
   parseToolExecuteInput,
   verifyBulkTransactionUpdates,
+  accountDateScopes,
+  fetchTransactionsByIds,
+  readTransactionsFile,
   beforeFieldsForUpdate,
   summarizeIncomeExpenseByMonth,
   detectRecurringFromTransactions,
@@ -3805,6 +3898,9 @@ export {
   withWriteGateDescription,
   parseToolExecuteInput,
   verifyBulkTransactionUpdates,
+  accountDateScopes,
+  fetchTransactionsByIds,
+  readTransactionsFile,
   beforeFieldsForUpdate,
   summarizeIncomeExpenseByMonth,
   detectRecurringFromTransactions,

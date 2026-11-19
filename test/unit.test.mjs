@@ -27,6 +27,9 @@ const {
   withWriteGateDescription,
   parseToolExecuteInput,
   verifyBulkTransactionUpdates,
+  accountDateScopes,
+  fetchTransactionsByIds,
+  readTransactionsFile,
   beforeFieldsForUpdate,
   summarizeIncomeExpenseByMonth,
   detectRecurringFromTransactions,
@@ -246,10 +249,12 @@ test("withWriteGateDescription appends the gate note exactly once", () => {
 });
 
 test("verifyBulkTransactionUpdates verifies a batch with a single list refetch", async (t) => {
+  // Dates relative to today: fixed dates drift out of the 90-day window.
+  const day = (n) => new Date(Date.now() - n * 864e5).toISOString().slice(0, 10);
   const requests = [];
   const listTransactions = [
-    { id: "t1", date: "2026-06-01", amount: -10000, approved: true, deleted: false },
-    { id: "t2", date: "2026-06-02", amount: -20000, approved: true, deleted: false },
+    { id: "t1", date: day(10), amount: -10000, approved: true, deleted: false },
+    { id: "t2", date: day(9), amount: -20000, approved: true, deleted: false },
   ];
   const realFetch = globalThis.fetch;
   globalThis.fetch = async (url) => {
@@ -276,7 +281,7 @@ test("verifyBulkTransactionUpdates verifies a batch with a single list refetch",
   // The whole batch must be verified with exactly one list request —
   // one GET per transaction starves the shared YNAB rate budget.
   assert.equal(requests.length, 1);
-  assert.match(requests[0], /\/plans\/plan-1\/transactions\?since_date=2026-06-01/);
+  assert.ok(requests[0].includes(`/plans/plan-1/transactions?since_date=${day(10)}`), requests[0]);
 });
 
 test("parseToolExecuteInput validates against the target tool schema", () => {
@@ -372,4 +377,93 @@ test("buildTransactionsCsv emits header plus one row per transaction", () => {
 
 test("currentBudgetMonth is the first of the current month", () => {
   assert.match(currentBudgetMonth(), /^\d{4}-\d{2}-01$/);
+});
+
+// Mock fetch that serves a fixed transaction list and records request URLs.
+function mockListFetch(t, listTransactions) {
+  const requests = [];
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = async (url) => {
+    requests.push(String(url));
+    return new Response(JSON.stringify({ data: { transactions: listTransactions } }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  };
+  t.after(() => { globalThis.fetch = realFetch; });
+  return requests;
+}
+
+test("accountDateScopes groups rows by account with min/max dates", () => {
+  assert.deepEqual(
+    accountDateScopes([
+      { account_id: "a", date: "2025-06-10" },
+      { account_id: "b", date: "2025-01-01" },
+      { account_id: "a", date: "2025-05-09" },
+      { account_id: "a", date: "2025-08-18" },
+      { date: "2025-01-01" },
+    ]),
+    [
+      { accountId: "a", sinceDate: "2025-05-09", untilDate: "2025-08-18" },
+      { accountId: "b", sinceDate: "2025-01-01", untilDate: "2025-01-01" },
+    ],
+  );
+});
+
+test("verifyBulkTransactionUpdates refetches old rows with one account-scoped request", async (t) => {
+  // Rows far older than the 90-day window used to fall back to one GET each.
+  const rows = [
+    { id: "t1", account_id: "acct-1", date: "2025-05-09", cleared: "reconciled", deleted: false },
+    { id: "t2_2025-06-05", account_id: "acct-1", date: "2025-06-05", cleared: "reconciled", deleted: false },
+    { id: "t3", account_id: "acct-1", date: "2025-08-18", cleared: "reconciled", deleted: false },
+  ];
+  const requests = mockListFetch(t, rows);
+  const requested = rows.map((r) => ({ id: r.id, cleared: "reconciled" }));
+  const { verification, verified } = await verifyBulkTransactionUpdates("plan-1", requested, rows);
+
+  assert.deepEqual(verification.failed, []);
+  assert.equal(verified.length, 3);
+  assert.equal(requests.length, 1);
+  assert.match(requests[0], /\/plans\/plan-1\/accounts\/acct-1\/transactions\?since_date=2025-05-09&until_date=2025-08-18/);
+});
+
+test("fetchTransactionsByIds uses the scope hint before the 90-day window", async (t) => {
+  const rows = [
+    { id: "t1", account_id: "acct-1", date: "2025-05-09", cleared: "cleared", deleted: false },
+    { id: "t2", account_id: "acct-1", date: "2025-07-01", cleared: "cleared", deleted: false },
+  ];
+  const requests = mockListFetch(t, rows);
+  const byId = await fetchTransactionsByIds("plan-1", ["t1", "t2"], { accountId: "acct-1", sinceDate: "2025-05-09" });
+
+  assert.equal(byId.size, 2);
+  assert.equal(requests.length, 1);
+  assert.match(requests[0], /\/accounts\/acct-1\/transactions\?since_date=2025-05-09/);
+});
+
+test("readTransactionsFile validates path, JSON and schema", async (t) => {
+  const { mkdtempSync, writeFileSync, rmSync } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+  const dir = mkdtempSync(join(tmpdir(), "ynab-txfile-"));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+
+  const good = join(dir, "good.json");
+  writeFileSync(good, JSON.stringify([{ id: "t1", cleared: "reconciled" }]));
+  assert.deepEqual(readTransactionsFile(good), [{ id: "t1", cleared: "reconciled" }]);
+
+  assert.throws(() => readTransactionsFile("relative.json"), /absolute path to a \.json file/);
+  assert.throws(() => readTransactionsFile(join(dir, "x.txt")), /absolute path to a \.json file/);
+  assert.throws(() => readTransactionsFile(join(dir, "missing.json")), /Could not read transactionsFile/);
+
+  const notJson = join(dir, "bad.json");
+  writeFileSync(notJson, "{nope");
+  assert.throws(() => readTransactionsFile(notJson), /is not valid JSON/);
+
+  const badShape = join(dir, "shape.json");
+  writeFileSync(badShape, JSON.stringify([{ id: "t1", cleared: "done" }]));
+  assert.throws(() => readTransactionsFile(badShape), /failed validation: 0\.cleared/);
+
+  const empty = join(dir, "empty.json");
+  writeFileSync(empty, "[]");
+  assert.throws(() => readTransactionsFile(empty), /failed validation/);
 });
