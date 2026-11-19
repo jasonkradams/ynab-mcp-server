@@ -11,7 +11,7 @@ import { createWritePreviews, fingerprint } from "./lib/write-previews.mjs";
 import { readWriteToolState } from "./lib/write-tool-state.mjs";
 import { createSerializedJournal, createDurableOperationRunner, retainJournalEntries } from "./lib/write-recovery.mjs";
 import { registerCategorySuggestionTools } from "./modules/category-suggestions.mjs";
-import { closeSync, fsyncSync, openSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import { closeSync, fsyncSync, openSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import path from "node:path";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
@@ -614,6 +614,10 @@ const {
   // Read-only MCP App views (ui:// resources). On by default for the local stdio server and
   // off for the hosted Worker, which has no filesystem to read the view files from.
   appViews = !IS_CLOUDFLARE_WORKERS,
+  // Let tools read input from local files (update_transactions'
+  // transactionsFile). Only the stdio entry point enables it: on a hosted
+  // server a path in tool input would point at the server's filesystem.
+  localFiles = false,
 } = options;
 
 // This state belongs to this factory invocation only. Hosted callers supply
@@ -760,6 +764,63 @@ const subtransactionInputSchema = z.object({
   payeeName: z.string().max(200).optional().describe("Payee name"),
   memo: z.string().max(500).optional().describe("Memo"),
 });
+
+const transactionUpdateItemSchema = z.object({
+  id: z.string().min(1).optional().describe("Transaction ID. Provide either id or importId (not both) to identify the transaction."),
+  importId: z.string().min(1).max(36).optional().describe("Lookup by import ID instead of id; cannot change existing import_id."),
+  accountId: z.string().optional().describe("Account ID"),
+  date: z.string().optional().describe("Transaction date (YYYY-MM-DD)"),
+  amount: z.number().optional().describe("Amount in dollars"),
+  payeeId: z.string().nullable().optional().describe("Payee ID (null to remove)"),
+  payeeName: z.string().max(200).nullable().optional().describe("Payee name (null to clear)"),
+  categoryId: z.string().nullable().optional().describe("Category ID (null to uncategorize)"),
+  memo: z.string().max(500).nullable().optional().describe("Transaction memo (null to clear)"),
+  cleared: z.enum(["cleared", "uncleared", "reconciled"]).optional().describe("Cleared status"),
+  approved: z.boolean().optional().describe("Approved status"),
+  flagColor: z.enum(["red", "orange", "yellow", "green", "blue", "purple"]).nullable().optional().describe("Flag color (null to remove)"),
+  subtransactions: z.array(subtransactionInputSchema).optional().describe("Convert non-split transaction to split; existing splits unsupported."),
+});
+
+const TRANSACTIONS_FILE_MAX_BYTES = 5 * 1024 * 1024;
+
+// Read a batch of updates from a local JSON file so large batches (hundreds of
+// ids) need not be inlined in the tool call. The file must be an absolute .json
+// path holding a non-empty array that passes the inline schema. Errors name the
+// path and schema issue only, never file contents.
+function readTransactionsFile(filePath) {
+  if (!localFiles) throw new Error("transactionsFile is only available on the local stdio server.");
+  if (typeof filePath !== "string" || !path.isAbsolute(filePath) || path.extname(filePath).toLowerCase() !== ".json") {
+    throw new Error("transactionsFile must be an absolute path to a .json file.");
+  }
+  let text;
+  try {
+    const st = statSync(filePath);
+    if (!st.isFile()) throw new Error("not a regular file");
+    if (st.size > TRANSACTIONS_FILE_MAX_BYTES) throw new Error(`larger than ${TRANSACTIONS_FILE_MAX_BYTES} bytes`);
+    text = readFileSync(filePath, "utf8");
+  } catch (err) {
+    throw new Error(`Could not read transactionsFile ${filePath}: ${err.message}`);
+  }
+  let parsed;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    throw new Error(`transactionsFile ${filePath} is not valid JSON.`);
+  }
+  const result = z.array(transactionUpdateItemSchema).min(1).safeParse(parsed);
+  if (!result.success) {
+    const issues = result.error.issues.slice(0, 5).map((i) => `${i.path.join(".") || "(root)"}: ${i.message}`);
+    throw new Error(`transactionsFile ${filePath} failed validation: ${issues.join("; ")}`);
+  }
+  return result.data;
+}
+
+function resolveTransactionsInput(transactions, transactionsFile) {
+  if ((transactions !== undefined) === (transactionsFile !== undefined)) {
+    throw new Error("Provide exactly one of transactions or transactionsFile.");
+  }
+  return transactionsFile !== undefined ? readTransactionsFile(transactionsFile) : transactions;
+}
 
 function mapSubtransactions(subtransactions) {
   return subtransactions.map((s) => ({
@@ -1013,6 +1074,41 @@ async function getFormattedTransaction(budgetId, transactionId) {
 // succeeded). Rows older than the window fall back to per-transaction GETs.
 const VERIFY_REFETCH_WINDOW_DAYS = 90;
 
+// Group rows by account and take each account's [min, max] date. One
+// account-scoped list request per group covers rows of any age without
+// downloading the whole budget, so rows older than the window no longer fall
+// through to one GET each (a 100-row reconcile of year-old rows cost ~100
+// GETs, half the hourly rate budget).
+function accountDateScopes(rows) {
+  const scopes = new Map();
+  for (const t of rows) {
+    if (!t?.account_id || !t?.date) continue;
+    const s = scopes.get(t.account_id);
+    if (!s) scopes.set(t.account_id, { accountId: t.account_id, sinceDate: t.date, untilDate: t.date });
+    else {
+      if (t.date < s.sinceDate) s.sinceDate = t.date;
+      if (t.date > s.untilDate) s.untilDate = t.date;
+    }
+  }
+  return [...scopes.values()];
+}
+
+// Fill byId from account-scoped list requests. Failures are swallowed: callers
+// fall back to the window list and per-transaction GETs for anything missing.
+async function fetchScopedTransactions(budgetId, wantedIds, scopes, byId) {
+  for (const { accountId, sinceDate, untilDate } of scopes) {
+    try {
+      const data = await fetchTransactions({ budgetId, accountId, sinceDate, untilDate });
+      for (const t of data.transactions) {
+        const id = normalizeTransactionId(t.id);
+        if (wantedIds.has(id) && !byId.has(id)) byId.set(id, formatTransaction(t));
+      }
+    } catch {
+      // Fall through.
+    }
+  }
+}
+
 async function prefetchUpdatedTransactions(budgetId, requestedUpdates, responseTransactions = []) {
   const wantedIds = new Set(requestedUpdates.map((r) => r.id && normalizeTransactionId(r.id)).filter(Boolean));
   const dates = [];
@@ -1020,6 +1116,9 @@ async function prefetchUpdatedTransactions(budgetId, requestedUpdates, responseT
   for (const r of requestedUpdates) if (r.date) dates.push(r.date);
 
   const byId = new Map();
+  // The PATCH response carries each row's account and post-write date, which
+  // is exactly the range to refetch.
+  await fetchScopedTransactions(budgetId, wantedIds, accountDateScopes(responseTransactions), byId);
   // Clamp the refetch to the window even when no row carried a date (e.g. an
   // approval batch whose PATCH response omitted transactions): one bounded
   // list request still beats N per-transaction GETs against the rate budget.
@@ -1030,16 +1129,18 @@ async function prefetchUpdatedTransactions(budgetId, requestedUpdates, responseT
     const minDate = dates.reduce((min, d) => (d < min ? d : min));
     if (minDate > windowStart) sinceDate = minDate;
   }
-  try {
-    const data = await fetchTransactions({ budgetId, sinceDate });
-    for (const t of data.transactions) {
-      const id = normalizeTransactionId(t.id);
-      if (wantedIds.has(id)) byId.set(id, formatTransaction(t));
+  if (byId.size < wantedIds.size) {
+    try {
+      const data = await fetchTransactions({ budgetId, sinceDate });
+      for (const t of data.transactions) {
+        const id = normalizeTransactionId(t.id);
+        if (wantedIds.has(id) && !byId.has(id)) byId.set(id, formatTransaction(t));
+      }
+    } catch {
+      // The write already succeeded; a failed bulk refetch (e.g. a response
+      // over MAX_RESPONSE_BYTES on a very busy budget) must not fail the tool
+      // call. Fall through to per-transaction GETs below.
     }
-  } catch {
-    // The write already succeeded; a failed bulk refetch (e.g. a response
-    // over MAX_RESPONSE_BYTES on a very busy budget) must not fail the tool
-    // call. Fall through to per-transaction GETs below.
   }
 
   // Fetch stragglers (outside the window, or absent from the list response)
@@ -1798,6 +1899,7 @@ async function prepareWrite(name, input, rawHandler) {
   const plan = await readWriteToolState(name, input, {
     api, fetchTransactions, getTransaction: getFormattedTransaction,
     normalizeId: normalizeTransactionId, resolveBudgetId, journal, tenantId, getTransactionsByIds: fetchTransactionsByIds,
+    readTransactionsFile: localFiles ? readTransactionsFile : null,
     buildCategoryPlan, readOperationStep, matchesAfter,
   });
   if (name === "undo_operation" && plan.before.entry.undo.type === "delete_transactions") {
@@ -3030,32 +3132,29 @@ registerTool(
 
 registerTool(
   "update_transactions",
-  { description: "Batch-update by id/importId. Combine categoryId and approved:true to categorize/approve. Refetches and verifies fields; reports mismatches without retrying financial writes. Check verification, not review queue counts. approved_count includes already-approved rows; report newly_approved_count. Use IDs from results only.", inputSchema: {
+  { description: `Batch-update by id/importId. Combine categoryId and approved:true to categorize/approve. Refetches and verifies fields; reports mismatches without retrying financial writes. Check verification, not review queue counts. approved_count includes already-approved rows; report newly_approved_count. Use IDs from results only. Pass scope when rows share one account so the pre-write snapshot is one request.${localFiles ? " For batches too large to inline, pass transactionsFile instead of transactions." : ""}`, inputSchema: {
     budgetId: z.string().optional(),
     transactions: z
-      .array(
-        z.object({
-          id: z.string().min(1).optional().describe("Transaction ID. Provide either id or importId (not both) to identify the transaction."),
-          importId: z.string().min(1).max(36).optional().describe("Lookup by import ID instead of id; cannot change existing import_id."),
-          accountId: z.string().optional().describe("Account ID"),
-          date: z.string().optional().describe("Transaction date (YYYY-MM-DD)"),
-          amount: z.number().optional().describe("Amount in dollars"),
-          payeeId: z.string().nullable().optional().describe("Payee ID (null to remove)"),
-          payeeName: z.string().max(200).nullable().optional().describe("Payee name (null to clear)"),
-          categoryId: z.string().nullable().optional().describe("Category ID (null to uncategorize)"),
-          memo: z.string().max(500).nullable().optional().describe("Transaction memo (null to clear)"),
-          cleared: z.enum(["cleared", "uncleared", "reconciled"]).optional().describe("Cleared status"),
-          approved: z.boolean().optional().describe("Approved status"),
-          flagColor: z.enum(["red", "orange", "yellow", "green", "blue", "purple"]).nullable().optional().describe("Flag color (null to remove)"),
-          subtransactions: z.array(subtransactionInputSchema).optional().describe("Convert non-split transaction to split; existing splits unsupported."),
-        })
-      )
-      .describe("Array of transaction updates"),
+      .array(transactionUpdateItemSchema)
+      .optional()
+      .describe(localFiles ? "Array of transaction updates. Provide exactly one of transactions or transactionsFile." : "Array of transaction updates"),
+    ...(localFiles ? {
+      transactionsFile: z.string().optional().describe("Absolute path to a local .json file holding the transactions array (same shape, max 5 MB). Its contents are bound into the preview."),
+    } : {}),
+    scope: z.object({
+      accountId: z.string().describe("Account all updated rows belong to"),
+      sinceDate: z.string().describe("Earliest row date (YYYY-MM-DD)"),
+      untilDate: z.string().optional().describe("Latest row date (YYYY-MM-DD)"),
+    }).optional().describe("Optional hint for the pre-write snapshot: one account-scoped list request replaces per-row GETs for rows older than 90 days. Rows outside it still work at one GET each."),
     returnSummary: z.boolean().optional().describe("Return updated/approval/verification counts instead of rows. Recommended for large batches (~50+); writes unchanged."),
   } },
-  ({ budgetId, transactions: txns, returnSummary }) =>
+  ({ budgetId, transactions: inlineTxns, transactionsFile, scope, returnSummary }) =>
     run(async () => {
       const bid = resolveBudgetId(budgetId);
+      // Guarded writes arrive here with transactionsFile already resolved into
+      // transactions by readWriteToolState (so the preview binds the contents);
+      // this branch covers direct calls.
+      const txns = resolveTransactionsInput(inlineTxns, transactionsFile);
       for (const t of txns) {
         // Same predicate the mapping below uses; a present-but-empty id must
         // be rejected here, not silently sent to YNAB as the lookup key.
@@ -3069,7 +3168,7 @@ registerTool(
       }));
       // Capture before-states pre-write for the undo journal (id-based rows
       // only; importId-only rows have no id yet and journal as non-undoable).
-      const beforeById = await fetchTransactionsByIds(bid, txns.filter((t) => t.id !== undefined).map((t) => t.id));
+      const beforeById = await fetchTransactionsByIds(bid, txns.filter((t) => t.id !== undefined).map((t) => t.id), scope);
       const { data } = await api.transactions.updateTransactions(bid, {
         transactions: mapped,
       });
@@ -3926,19 +4025,24 @@ function beforeFieldsForUpdate(requested, beforeTransaction) {
 
 // One list request covering recent history, with per-transaction GET fallback
 // only for stragglers — same budget-friendly shape as prefetchUpdatedTransactions.
-async function fetchTransactionsByIds(budgetId, ids) {
+async function fetchTransactionsByIds(budgetId, ids, scope) {
   const wanted = new Set(ids.map(normalizeTransactionId));
   const byId = new Map();
+  // Optional caller hint: rows' account and date range aren't known before the
+  // write, so without it rows older than the window cost one GET each.
+  if (scope) await fetchScopedTransactions(budgetId, wanted, [scope], byId);
   const sinceDate = new Date(Date.now() - VERIFY_REFETCH_WINDOW_DAYS * 24 * 60 * 60 * 1000)
     .toISOString().slice(0, 10);
-  try {
-    const data = await fetchTransactions({ budgetId, sinceDate });
-    for (const t of data.transactions) {
-      const id = normalizeTransactionId(t.id);
-      if (wanted.has(id)) byId.set(id, formatTransaction(t));
+  if (byId.size < wanted.size) {
+    try {
+      const data = await fetchTransactions({ budgetId, sinceDate });
+      for (const t of data.transactions) {
+        const id = normalizeTransactionId(t.id);
+        if (wanted.has(id) && !byId.has(id)) byId.set(id, formatTransaction(t));
+      }
+    } catch {
+      // Fall through to per-transaction GETs.
     }
-  } catch {
-    // Fall through to per-transaction GETs.
   }
   const missing = [...wanted].filter((id) => !byId.has(id));
   await Promise.all(missing.map(async (id) => {
@@ -4745,6 +4849,9 @@ return {
     parseToolExecuteInput,
     invokeRegisteredTool,
     verifyBulkTransactionUpdates,
+    accountDateScopes,
+    fetchTransactionsByIds,
+    readTransactionsFile,
     beforeFieldsForUpdate,
     summarizeApprovalChanges,
     decodeHtmlEntities,
@@ -4783,6 +4890,7 @@ const defaultInstance = IS_CLOUDFLARE_WORKERS ? null : createYnabServer({
   writesEnabled: runtimeConfig.values.YNAB_ALLOW_WRITES?.value === "1",
   journal: IS_CLOUDFLARE_WORKERS ? null : createFsJournal(undoJournalPath()),
   onToolError: errorReportingEnabled() ? captureToolError : null,
+  localFiles: true,
   runtime: {
     tokenSource: runtimeConfig.tokenSource,
     detected_agent: runtimeConfig.detected_agent,
@@ -4824,6 +4932,9 @@ const {
   parseToolExecuteInput,
   invokeRegisteredTool,
   verifyBulkTransactionUpdates,
+  accountDateScopes,
+  fetchTransactionsByIds,
+  readTransactionsFile,
   beforeFieldsForUpdate,
   summarizeApprovalChanges,
   decodeHtmlEntities,
@@ -4869,6 +4980,9 @@ export {
   parseToolExecuteInput,
   invokeRegisteredTool,
   verifyBulkTransactionUpdates,
+  accountDateScopes,
+  fetchTransactionsByIds,
+  readTransactionsFile,
   beforeFieldsForUpdate,
   summarizeApprovalChanges,
   decodeHtmlEntities,
