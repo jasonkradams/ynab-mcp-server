@@ -59,6 +59,32 @@ test("transactionsFile is unavailable unless the server enables local files", as
   assert.equal(harness.fake.writes().length, 0);
 });
 
+test("occurrences of one scheduled transaction (uuid_YYYY-MM-DD) are distinct rows in a batch", async (t) => {
+  const harness = await createMcpHarness(); t.after(() => harness.close());
+  const rows = harness.fake.budget().transactions;
+  const base = { account_id: "fake-checking", payee_id: "fake-market", category_id: "fake-food", approved: true, cleared: "cleared", deleted: false, memo: null, subtransactions: [], _knowledge: 1 };
+  rows.push({ ...base, id: "fake-sched_2019-02-15", date: "2019-02-15", amount: -1000 });
+  rows.push({ ...base, id: "fake-sched_2019-03-15", date: "2019-03-15", amount: -2000 });
+
+  const result = await harness.write("update_transactions", {
+    transactions: [{ id: "fake-sched_2019-02-15", cleared: "reconciled" }, { id: "fake-sched_2019-03-15", cleared: "reconciled" }],
+    scope: { accountId: "fake-checking", sinceDate: "2019-01-01" },
+    returnSummary: true,
+  });
+  const data = assertToolOk(result);
+  assert.equal(data.verification.failed, 0);
+  assert.deepEqual(rows.filter((r) => r.id.startsWith("fake-sched_")).map((r) => r.cleared), ["reconciled", "reconciled"]);
+  assert.equal(harness.fake.requests.filter((r) => r.method === "GET" && /\/transactions\/fake-sched/.test(r.path)).length, 0);
+});
+
+test("get_transaction reads a realized scheduled occurrence by its full composite id", async (t) => {
+  const harness = await createMcpHarness(); t.after(() => harness.close());
+  harness.fake.budget().transactions.push({ id: "fake-sched_2019-04-15", date: "2019-04-15", amount: -3000, account_id: "fake-checking", payee_id: "fake-market", category_id: "fake-food", approved: true, cleared: "cleared", deleted: false, memo: null, subtransactions: [], _knowledge: 1 });
+  const data = assertToolOk(await harness.call("get_transaction", { transactionId: "fake-sched_2019-04-15" }));
+  assert.equal(data.id, "fake-sched_2019-04-15");
+  assert.equal(data.amount, -3);
+});
+
 process.env.YNAB_MCP_NO_AUTOSTART = "1";
 const { accountDateScopes, readTransactionsFile } = await import("../index.js");
 
